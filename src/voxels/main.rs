@@ -5,6 +5,9 @@
 // - Implement proper camera controls
 // - Dynamic lighting (eg. holding a torch that lights up the surrounding area and maybe flickers a bit)
 
+// Architecture
+// - Investigate some sort of entity-component system
+
 // Professional Mode
 // - Proper error handling
 // - Proper logging
@@ -17,6 +20,9 @@
 // - Mods, well-integrated into the game itself (with an API and so forth) 
 // - Scripting, with an editor
 
+// Lova's ideas
+// - tiny blocks that you can use to make vehicles
+
 // use std::path::Path;
 use std::env;
 use std::error::Error;
@@ -24,6 +30,7 @@ use std::time::{Instant};
 use std::io::Cursor;
 use std::fs;
 use std::collections::{HashSet};
+use std::iter::Iterator;
 
 use glium::*;
 use glium::{
@@ -39,6 +46,7 @@ use cgmath::{Matrix3, Matrix4, Vector3, Point3, Rad};
 
 mod geometry;
 mod voxel;
+mod world;
 
 pub struct Camera {
     pub position: Vector3<f32>, 
@@ -51,6 +59,8 @@ impl Camera {
         Matrix4::from_value(1.0)
     }
 }
+
+pub struct Inventory {}
 
 pub struct Orientation {
     pub rotation_y: Rad<f32>, pub rotation_z: Rad<f32>
@@ -70,6 +80,14 @@ impl Orientation {
     fn left(&self) -> Vector3<f32> { self.forwards().rotate(Rad(PI * 0.5)) }
 
     fn right(&self) -> Vector3<f32> { self.forwards().rotate(Rad(-PI * 0.5)) }
+
+    fn looking_at(&self) -> Vector3<f32> {
+        Vector3::new(
+            self.rotation_y.cos(),
+            self.rotation_z.cos(), // TODO: Make sure this is correct
+            self.rotation_y.sin()
+        ).normalize()
+    }
 }
 
 // TODO: This is probably included in cgmath via a trait somehow, so we really should be using that
@@ -124,17 +142,31 @@ static PI: f32 = std::f32::consts::PI;
 fn create_world() -> voxel::World {
     use voxel::{Block, Chunk};
 
-    return (0 .. 3)
-        .map(|n| {
+    return (0 .. 10)
+        .map(|ichunk| {
             let mut chunk: Chunk = vec![];
 
-            for n in 0 .. 10 {
-                let block = match n {
-                    0 => Block::GRASS,
-                    1 => Block::DIRT,
+            for layer in 0 .. 32 {
+                let block = match layer {
+                    0 => Block::AIR,
+                    1 => Block::AIR,
+                    2 => Block::AIR,
+                    3 => Block::AIR,
+                    4 => Block::AIR,
+                    5 => Block::AIR,
+                    6 => Block::AIR,
+                    7 => Block::STONE,
+                    8 => Block::AIR,
+                    9 => Block::AIR,
+                    10 => Block::AIR,
+                    11 => Block::GRASS,
+                    12 => Block::DIRT,
+                    13 => Block::DIRT,
+                    14 => Block::DIRT,
+                    15 => Block::DIRT,
                     _ => Block::STONE,
                 };
-        
+
                 chunk.push(
                     [
                         [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
@@ -165,8 +197,8 @@ fn create_world() -> voxel::World {
 fn texture_offset_for_block(block: voxel::Block) -> (f32, f32) {
     match block {
         voxel::Block::GRASS => (0.0, 5.0 * 1.0 / 6.0),
-        voxel::Block::DIRT  => (0.0, 4.0 * 1.0 / 6.0),
-        voxel::Block::STONE => (0.0, 1.0 * 1.0 / 6.0),
+        voxel::Block::STONE => (0.0, 4.0 * 1.0 / 6.0),
+        voxel::Block::DIRT  => (0.0, 3.0 * 1.0 / 6.0),
         _ => (0.0, 0.0)
     }
 }
@@ -178,16 +210,74 @@ fn tick<'a>(keyboard: &'a HashSet::<VirtualKeyCode>, actor: &'a mut Actor, world
     // }
 
     // Animate
-    if actor.position.y > 2.0 {
-        let gravity = cgmath::vec3(0.0, -9.82, 0.0);
-        actor.velocity += gravity * dt_seconds;
-        actor.position += actor.velocity * dt_seconds;
-        if actor.position.y <= 2.0 {
-            actor.velocity = cgmath::vec3(0.0, 0.0, 0.0);
+    // TODO: Define actor bounding-box properly
+    let ichunk: usize = (actor.position.x / 16.0).floor() as usize;
+    let chunk_x = (actor.position.x as usize) % 16;
+    let chunk_z = (actor.position.z as usize) % 16;
+    if ichunk < world.len() {
+        println!("{} {} {}", ichunk, chunk_x, chunk_z);
+        let y_of_lowest_solid = world[ichunk]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, layer)|
+                if (-11.0 + i as f32) < actor.position.y && layer[chunk_x][chunk_z] != voxel::Block::AIR {
+                    Some(-11.0 + i as f32)
+                } else {
+                    None
+                })
+            .last()
+            .unwrap_or(-11.0);
+
+        println!("{:?}", y_of_lowest_solid);
+        println!("{:?}", actor.position);
+
+        if (actor.position.y - 2.0) > y_of_lowest_solid {
+            let gravity = cgmath::vec3(0.0, -9.82, 0.0);
+            actor.velocity += gravity * dt_seconds;
+            actor.position += actor.velocity * dt_seconds;
+            if (actor.position.y - 2.0) <= (y_of_lowest_solid) {
+                actor.velocity.y = 0.0;
+                actor.position.y = y_of_lowest_solid + 2.0;
+            }
+        } else {
+            actor.position += actor.velocity * dt_seconds;
         }
-    } else {
-        actor.position += actor.velocity * dt_seconds;
     }
+}
+
+///
+fn make_cube_instance(kind: voxel::Block, world_position: (f32, f32, f32)) -> Option<CubeInstanceAttributes> {
+    if kind == voxel::Block::AIR {
+        Option::None
+    } else {
+        Some(CubeInstanceAttributes {
+            world_position: world_position,
+            texture_offset: texture_offset_for_block(kind)
+        })
+    }
+}
+
+///
+fn make_chunk_instance_attributes<'a>(ichunk: usize, chunk: &'a voxel::Chunk) -> impl Iterator<Item = CubeInstanceAttributes> + 'a {
+    let chunk_origin = Vector3::new((ichunk * 16) as f32, 0.0, 0.0);
+
+    chunk
+        .iter()
+        .enumerate()
+        .flat_map(move |(ilayer, layer)| {
+            return layer
+                .iter()
+                .enumerate()
+                .flat_map(move |(x, row)| {
+                    row
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(z, block)| {
+                            let cube_offset_in_chunk = Vector3::new(x as f32 + 0.5, 11.0 - ilayer as f32 - 0.5, z as f32 + 0.5);
+                            make_cube_instance(*block, (chunk_origin + cube_offset_in_chunk).into())
+                        })
+                })
+        })
 }
 
 fn render_frame<'a>(
@@ -197,6 +287,12 @@ fn render_frame<'a>(
     actor: &'a Actor,
     world: &'a Vec<voxel::Chunk>,
 ) {
+    let bla = match 5 {
+        0 => "hello",
+        1 => "world",
+        2 => "hola",
+        _ => "no idea"
+    };
 
     // Some settings
     let sky_colour = (0.0/255.0, 206.0/255.0, 237.0/255.0, 1.0);
@@ -232,36 +328,13 @@ fn render_frame<'a>(
     let render_distance_z: i32 = 32;
 
     // TODO: We'll need to optimise the hell out of this eventually...
+    // TODO: Factor out coordinate logic to make it more readable and re-usable.
+    // TODO: Caching? Is there a way of caching per-chunk and then concatenating the results?
     let per_instance = {
         let data: Vec<CubeInstanceAttributes> = world
             .iter()
             .enumerate()
-            .flat_map(|(ichunk, chunk)| {
-                let (chunk_origin_x, chunk_origin_z) = ((ichunk * 16) as f32, 0.0);
-                return chunk
-                    .iter()
-                    .enumerate()
-                    .flat_map(move |(ilayer, layer)| {
-                        return layer
-                            .iter()
-                            .enumerate()
-                            .flat_map(move |(x, row)| {
-                                return row
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(move |(z, block)| {
-                                        if *block == voxel::Block::AIR {
-                                            Option::None
-                                        } else {
-                                            Some(CubeInstanceAttributes {
-                                                world_position: (chunk_origin_x + x as f32, 0.0 - ilayer as f32, chunk_origin_z + z as f32),
-                                                texture_offset: texture_offset_for_block(*block)
-                                            })
-                                        }
-                                    })
-                            });
-                    });
-            })
+            .flat_map(|(ichunk, chunk)| { make_chunk_instance_attributes(ichunk, chunk) })
             .collect();
         glium::VertexBuffer::dynamic(display, &data).unwrap()
     };
@@ -359,8 +432,7 @@ fn render_frame<'a>(
 // TODO: error handling
 pub fn load_texture(display: &glium::Display, path: std::string::String) -> glium::texture::SrgbTexture2d {
     let data = fs::read(path).unwrap();
-    let image = image::load(Cursor::new(&data[..]),
-    image::ImageFormat::Png).unwrap().to_rgba();
+    let image = image::load(Cursor::new(&data[..]), image::ImageFormat::Png).unwrap().to_rgba();
     let image_dimensions = image.dimensions();
     let image = glium::texture::RawImage2d::from_raw_rgba_reversed(&image.into_raw(), image_dimensions);
     return glium::texture::SrgbTexture2d::new(display, image).unwrap();
@@ -371,8 +443,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         env::set_var("WINIT_UNIX_BACKEND", "x11");
     }
 
-    let width = 720*2;
-    let height = 480*2;
+    let width = 720*3;
+    let height = 480*3;
 
     let window = glium::glutin::window::WindowBuilder::new()
         .with_inner_size(glium::glutin::dpi::PhysicalSize::new(width, height))
@@ -387,7 +459,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let display = glium::Display::new(window, context, &event_loop)?;
 
     let mut player = Actor {
-          position: cgmath::vec3(0.0, 2.0, 0.0)
+          position: cgmath::vec3(2.0, 2.0, 0.0)
         , velocity: cgmath::vec3(0.0, 0.0, 0.0)
         , jump_velocity: 4.3
         , orientation: Orientation { rotation_y: Rad(0.0), rotation_z: Rad(0.0) }
@@ -499,7 +571,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     )?;
 
     let _scale = display.gl_window().window().scale_factor();
-
+    
     let mut time_of_last_frame = Instant::now();
 
     let maximum_frames_per_second: f32 = 30.0;
@@ -576,6 +648,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             let chunk_x: usize = (player.position.x as usize) / 16;
                             let chunk_z: usize = 0; // (player.position.x as usize) / 16;
 
+                            // TODO: Ray intersection with world to find out what cube we're looking at.
+
                             // TODO: Factor out block placing logic
                             if chunk_z == 0 && chunk_x < world.len() {
                                 world[chunk_x][0][(player.position.x as usize) % 16][(player.position.z as usize) % 16] = voxel::Block::DIRT;
@@ -593,7 +667,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             let (w, h) = display.get_framebuffer_dimensions();
                             (w as f32, h as f32)
                         };
-                        
+
                         // TODO: Implement proper mouse sensitivity settings. There's no reason to tie it to the screen dimensions.
 
                         let normalised_x_delta = (delta.0 as f32)/(screen_width);
