@@ -31,6 +31,7 @@ use std::io::Cursor;
 use std::fs;
 use std::collections::{HashSet};
 use std::iter::Iterator;
+use std::borrow::Cow;
 
 use glium::*;
 use glium::{
@@ -44,9 +45,14 @@ use glutin::{
 use cgmath::prelude::*;
 use cgmath::{Matrix3, Matrix4, Vector3, Point3, Rad};
 
+use rusttype::gpu_cache::Cache;
+use rusttype::{point, vector, Font, PositionedGlyph, Rect, Scale, Point};
+
 mod geometry;
 mod voxel;
 mod world;
+mod ui;
+mod text;
 
 pub struct Camera {
     pub position: Vector3<f32>, 
@@ -103,13 +109,14 @@ impl Rot for Vector3<f32> {
 
 pub struct Actor {
     // Extrinsic properties
-    pub position: Vector3<f32>,
+    pub position: Vector3<f32>, // Assumed to be the geometric centre.
     pub velocity: Vector3<f32>, // Walk velocity
     pub jump_velocity: f32,
     pub orientation: Orientation,
 
     // Intrinsic properties
-    pub speed: f32,
+    pub speed: f32, /// This is the speed at which the actor moves when walking.
+    pub size: Vector3<f32>
 }
 
 pub struct AssetCatalogue {
@@ -117,12 +124,25 @@ pub struct AssetCatalogue {
     pub textures: (),
 }
 
-pub struct GraphicsCardResources {
+pub struct GraphicsCardResources<'a> {
     pub textured_shader: glium::Program,
     pub coloured_shader: glium::Program,
+    pub monochrome_shader: glium::Program,
+    pub textured_array_shader: glium::Program,
+
     pub cube_vertex_buffer: glium::VertexBuffer<geometry::Vertex>,
     pub axes_vertex_buffer: glium::VertexBuffer<geometry::Vertex>,
+
     pub texture_atlas: glium::texture::SrgbTexture2d,
+    pub textures_array: glium::texture::SrgbTexture2dArray,
+
+    pub shapes: Vec<((VertexBuffer<geometry::Vertex>, IndexBuffer<u16>), Vec<(Vector3<f32>, [f32; 4])>)>,
+
+    pub font: Font<'a>,
+    pub glyph_cache: Cache<'a>,
+    pub glyph_cache_texture: glium::Texture2d,
+    pub text_vertex_buffer: glium::VertexBuffer<text::Vertex>,
+    pub text_quad_vertex_buffer: glium::VertexBuffer<geometry::Vertex>,
 }
 
 pub struct Settings {
@@ -134,19 +154,18 @@ pub struct Settings {
 struct CubeInstanceAttributes {
     world_position: (f32, f32, f32),
     texture_offset: (f32, f32),
+    texture_index: f32,
 }
-implement_vertex!(CubeInstanceAttributes, world_position, texture_offset);
+implement_vertex!(CubeInstanceAttributes, world_position, texture_offset, texture_index);
 
 static PI: f32 = std::f32::consts::PI;
 
 fn create_world() -> voxel::World {
-    use voxel::{Block, Chunk};
+    use voxel::{Block};
 
-    return (0 .. 10)
-        .map(|ichunk| {
-            let mut chunk: Chunk = vec![];
-
-            for layer in 0 .. 32 {
+    (0 .. 1)
+        .map(|_ichunk| {
+            (0 .. 32).map(|layer| {
                 let block = match layer {
                     0 => Block::AIR,
                     1 => Block::AIR,
@@ -167,39 +186,27 @@ fn create_world() -> voxel::World {
                     _ => Block::STONE,
                 };
 
-                chunk.push(
-                    [
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block],
-                        [block, block, block, block, block, block, block, block, block, block, block, block, block, block, block, block]
-                    ]
-                );
-            }
-
-            chunk
+                [[block; 16]; 16]
+            }).collect()
         })
-        .collect();
+        .collect()
 }
 
-fn texture_offset_for_block(block: voxel::Block) -> (f32, f32) {
+//fn texture_offset_for_block(block: voxel::Block) -> (f32, f32) {
+//    match block {
+//        voxel::Block::GRASS => (0.0, 5.0 * 1.0 / 6.0),
+//        voxel::Block::STONE => (0.0, 4.0 * 1.0 / 6.0),
+//        voxel::Block::DIRT  => (0.0, 3.0 * 1.0 / 6.0),
+//        _ => (0.0, 0.0)
+//    }
+//}
+
+fn texture_index_for_block(block: voxel::Block) -> f32 {
     match block {
-        voxel::Block::GRASS => (0.0, 5.0 * 1.0 / 6.0),
-        voxel::Block::STONE => (0.0, 4.0 * 1.0 / 6.0),
-        voxel::Block::DIRT  => (0.0, 3.0 * 1.0 / 6.0),
-        _ => (0.0, 0.0)
+        voxel::Block::DIRT  => 0.0,
+        voxel::Block::GRASS => 1.0,
+        voxel::Block::STONE => 2.0,
+        _ => 0.0
     }
 }
 
@@ -211,48 +218,45 @@ fn tick<'a>(keyboard: &'a HashSet::<VirtualKeyCode>, actor: &'a mut Actor, world
 
     // Animate
     // TODO: Define actor bounding-box properly
+    // TODO: Deal with collisions across chunk boundaries
+    // TODO: Horizontal collisions
     let ichunk: usize = (actor.position.x / 16.0).floor() as usize;
     let chunk_x = (actor.position.x as usize) % 16;
     let chunk_z = (actor.position.z as usize) % 16;
     if ichunk < world.len() {
         println!("{} {} {}", ichunk, chunk_x, chunk_z);
-        let y_of_lowest_solid = world[ichunk]
-            .iter()
-            .enumerate()
-            .filter_map(|(i, layer)|
-                if (-11.0 + i as f32) < actor.position.y && layer[chunk_x][chunk_z] != voxel::Block::AIR {
-                    Some(-11.0 + i as f32)
-                } else {
-                    None
-                })
-            .last()
-            .unwrap_or(-11.0);
+        let current_chunk = &world[ichunk];
+        let chunk_y = (current_chunk.len() as f32 - actor.position.y) as usize; // TODO: make sure this is correct
 
-        println!("{:?}", y_of_lowest_solid);
-        println!("{:?}", actor.position);
+        let block_below_actor = current_chunk[chunk_y][chunk_x][chunk_z];
 
-        if (actor.position.y - 2.0) > y_of_lowest_solid {
-            let gravity = cgmath::vec3(0.0, -9.82, 0.0);
+        let gravity = cgmath::vec3(0.0, -9.82, 0.0);
+
+        if block_below_actor != voxel::Block::AIR {
             actor.velocity += gravity * dt_seconds;
             actor.position += actor.velocity * dt_seconds;
-            if (actor.position.y - 2.0) <= (y_of_lowest_solid) {
+            if (actor.position.y - 2.0) <= (chunk_y as f32) {
                 actor.velocity.y = 0.0;
-                actor.position.y = y_of_lowest_solid + 2.0;
+                actor.position.y = (chunk_y as f32) + 2.0;
             }
         } else {
+            actor.velocity += gravity * dt_seconds;
             actor.position += actor.velocity * dt_seconds;
         }
+    } else {
+        actor.position += actor.velocity * dt_seconds;
     }
 }
 
-///
+/// Constructs `CubeInstanceAttributes` that can be used to render a voxel at a specific position in the world, without duplicating geometry data.
 fn make_cube_instance(kind: voxel::Block, world_position: (f32, f32, f32)) -> Option<CubeInstanceAttributes> {
     if kind == voxel::Block::AIR {
         Option::None
     } else {
         Some(CubeInstanceAttributes {
             world_position: world_position,
-            texture_offset: texture_offset_for_block(kind)
+            texture_offset: (0.0, 0.0), // texture_offset_for_block(kind),
+            texture_index: texture_index_for_block(kind),
         })
     }
 }
@@ -265,7 +269,7 @@ fn make_chunk_instance_attributes<'a>(ichunk: usize, chunk: &'a voxel::Chunk) ->
         .iter()
         .enumerate()
         .flat_map(move |(ilayer, layer)| {
-            return layer
+            layer
                 .iter()
                 .enumerate()
                 .flat_map(move |(x, row)| {
@@ -273,7 +277,8 @@ fn make_chunk_instance_attributes<'a>(ichunk: usize, chunk: &'a voxel::Chunk) ->
                         .iter()
                         .enumerate()
                         .filter_map(move |(z, block)| {
-                            let cube_offset_in_chunk = Vector3::new(x as f32 + 0.5, 11.0 - ilayer as f32 - 0.5, z as f32 + 0.5);
+                            // TODO: Factor out this mapping between 'world indices' to world coordinates. IMPORTANT!!!  n0
+                            let cube_offset_in_chunk = Vector3::new(x as f32 + 0.5, chunk.len() as f32 - ilayer as f32 - 0.5, z as f32 + 0.5);
                             make_cube_instance(*block, (chunk_origin + cube_offset_in_chunk).into())
                         })
                 })
@@ -282,18 +287,12 @@ fn make_chunk_instance_attributes<'a>(ichunk: usize, chunk: &'a voxel::Chunk) ->
 
 fn render_frame<'a>(
     display: &'a Display,
-    resources: &'a GraphicsCardResources,
+    resources: &'a mut GraphicsCardResources,
     settings: &'a Settings,
     actor: &'a Actor,
     world: &'a Vec<voxel::Chunk>,
+    program_start_time: Instant
 ) {
-    let bla = match 5 {
-        0 => "hello",
-        1 => "world",
-        2 => "hola",
-        _ => "no idea"
-    };
-
     // Some settings
     let sky_colour = (0.0/255.0, 206.0/255.0, 237.0/255.0, 1.0);
 
@@ -328,7 +327,6 @@ fn render_frame<'a>(
     let render_distance_z: i32 = 32;
 
     // TODO: We'll need to optimise the hell out of this eventually...
-    // TODO: Factor out coordinate logic to make it more readable and re-usable.
     // TODO: Caching? Is there a way of caching per-chunk and then concatenating the results?
     let per_instance = {
         let data: Vec<CubeInstanceAttributes> = world
@@ -342,16 +340,20 @@ fn render_frame<'a>(
     let light_position: [f32; 3] = [0.0, 8.0, 0.0];
 
     let uniforms = uniform! {
-        texture: resources.texture_atlas.sampled().magnify_filter(glium::uniforms::MagnifySamplerFilter::Nearest),
+        texture: resources.textures_array
+            .sampled()
+            .minify_filter(glium::uniforms::MinifySamplerFilter::Nearest)
+            .magnify_filter(glium::uniforms::MagnifySamplerFilter::Nearest),
         projection: Into::<[[f32; 4]; 4]>::into(projection_matrix),
         view: Into::<[[f32; 4]; 4]>::into(view_matrix),
         light_position: Into::<[f32; 3]>::into(actor.position),
     };
 
+    // Draw all the voxels
     target.draw(
         (&resources.cube_vertex_buffer, per_instance.per_instance().unwrap()),
         glium::index::NoIndices(settings.primitive),
-        &resources.textured_shader,
+        &resources.textured_array_shader,
         &uniforms,
         &glium::DrawParameters {
             depth: glium::Depth {
@@ -384,58 +386,101 @@ fn render_frame<'a>(
             },
             blend: glium::Blend::alpha_blending(),
             multisampling: true,
-            line_width: Some(6.0),
             ..Default::default()
         },
     ).unwrap();
 
-    // let held_block_uniforms = uniform! {
-    //     texture: resources.texture_atlas.sampled().magnify_filter(glium::uniforms::MagnifySamplerFilter::Nearest),
-    //     projection: Into::<[[f32; 4]; 4]>::into(projection_matrix),
-    //     view: Into::<[[f32; 4]; 4]>::into(view_matrix),
-    //     light_position: Into::<[f32; 3]>::into(actor.position),
-    // };
+    let ui_projection = cgmath::ortho(-screen_width * 0.5, screen_width * 0.5, -screen_height * 0.5, screen_height * 0.5, -0.1f32, 100.0f32);
 
-    // let held_block_data = vec![
-    //     CubeInstanceAttributes {
-    //         world_position: (actor.position + actor.orientation.forwards() * 0.2).into(),
-    //         texture_offset: (0.0, 5.0 * 1.0 / 6.0)
-    //     }
-    // ];
+    // Render the u (just a rounded rectangle for now)
+    for (shape, instances) in &resources.shapes {
+        for (position, colour) in instances {
+            let translation = Matrix4::from_translation(*position);
+            let ui_uniforms = uniform! {
+                modelview: Into::<[[f32; 4]; 4]>::into(ui_projection.concat(&translation)),
+                colour: *colour
+            };
+    
+            target.draw(
+                &shape.0,
+                &shape.1,
+                &resources.monochrome_shader,
+                &ui_uniforms,
+                &Default::default(),
+            ).unwrap();
+        }
+    }
 
-    // let held_block_attr_buffer = glium::VertexBuffer::dynamic(
-    //     display,
-    //     &held_block_data
-    // );
+    // Render text, just to see if it works (should be part of UI system later, and maybe for signs and things in-the-world too)
+    if false {
+        text::create_text_vertices(display, &resources.font, &mut resources.glyph_cache, 1.0, &resources.glyph_cache_texture, 20, &vec!["Once upon a time".to_string(), "in Mexico".to_string()]);
+        let translation = Matrix4::from_translation(cgmath::vec3(0.0, 20.0, 0.0));
+        let text_uniforms = uniform! {
+            texture: resources.glyph_cache_texture
+                .sampled()
+                .magnify_filter(glium::uniforms::MagnifySamplerFilter::Nearest),
+            projection: Into::<[[f32; 4]; 4]>::into(projection_matrix),
+            view: Into::<[[f32; 4]; 4]>::into(view_matrix.concat(&translation)),
+            light_position: Into::<[f32; 3]>::into(actor.position),
+        };
+        target.draw(
+            &resources.text_quad_vertex_buffer,
+            glium::index::NoIndices(glium::index::PrimitiveType::TrianglesList),
+            &resources.textured_shader,
+            &text_uniforms,
+            &glium::DrawParameters {
+                depth: glium::Depth {
+                    test: glium::draw_parameters::DepthTest::IfLess,
+                    write: true,
+                    .. Default::default()
+                },
+                blend: glium::Blend::alpha_blending(),
+                multisampling: true,
+                ..Default::default()
+            },
+        ).unwrap();
+    }
 
-    // target.draw(
-    //     (&resources.cube_vertex_buffer, held_block_attr_buffer.unwrap().per_instance().unwrap()),
-    //     glium::index::NoIndices(glium::index::PrimitiveType::TrianglesList),
-    //     &resources.textured_shader,
-    //     &held_block_uniforms,
-    //     &glium::DrawParameters {
-    //         depth: glium::Depth {
-    //             test: glium::draw_parameters::DepthTest::IfLess,
-    //             write: true,
-    //             .. Default::default()
-    //         },
-    //         blend: glium::Blend::alpha_blending(),
-    //         multisampling: true,
-    //         ..Default::default()
-    //     },
-    // ).unwrap();
+    let t = Instant::now().duration_since(program_start_time).as_secs_f32(); // Ugly hack just to try to animate colour
+
+    let translation = Matrix4::from_translation(cgmath::vec3(0.0, -200.0, 0.0));
+    let scale = Matrix4::from_scale(800.0);
+    let modelview = translation.concat(&scale);
+    text::render(&mut target, &resources.text_vertex_buffer, &resources.glyph_cache_texture, &resources.textured_shader, ui_projection, modelview);
 
     target.finish().unwrap();
+}
+
+pub fn create_shape_buffers(display: &glium::Display, shape: lyon::lyon_tessellation::VertexBuffers<lyon::math::Point, u16>) -> (VertexBuffer<geometry::Vertex>, IndexBuffer<u16>) {
+    let vertices: Vec<geometry::Vertex> = shape.vertices
+        .into_iter()
+        .map(|p| geometry::Vertex { position: [p.x, p.y, 0.0], colour: [1.0, 0.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0], tex_coords: [0.0, 0.0] })
+        .collect();
+
+    (
+          glium::VertexBuffer::new(display, &vertices).unwrap()
+        , IndexBuffer::new(display, glium::index::PrimitiveType::TriangleStrip, &shape.indices[..]).unwrap()
+    )
 }
 
 /// 
 // TODO: error handling
 pub fn load_texture(display: &glium::Display, path: std::string::String) -> glium::texture::SrgbTexture2d {
+    let image = load_raw_image_2d(path);
+    glium::texture::SrgbTexture2d::new(display, image).unwrap()
+}
+
+pub fn load_raw_image_2d<'a>(path: std::string::String) -> glium::texture::RawImage2d<'a, u8> {
     let data = fs::read(path).unwrap();
     let image = image::load(Cursor::new(&data[..]), image::ImageFormat::Png).unwrap().to_rgba();
-    let image_dimensions = image.dimensions();
-    let image = glium::texture::RawImage2d::from_raw_rgba_reversed(&image.into_raw(), image_dimensions);
-    return glium::texture::SrgbTexture2d::new(display, image).unwrap();
+    let size = image.dimensions();
+    glium::texture::RawImage2d::from_raw_rgba_reversed(&image.into_raw(), size)
+}
+
+pub fn load_array_texture(display: &glium::Display, paths: Vec<std::string::String>) -> glium::texture::SrgbTexture2dArray {
+    glium::texture::SrgbTexture2dArray::new(
+        display, paths.iter().map(|path| { load_raw_image_2d(path.to_string()) }).collect()
+    ).unwrap()
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -459,12 +504,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let display = glium::Display::new(window, context, &event_loop)?;
 
     let mut player = Actor {
-          position: cgmath::vec3(2.0, 2.0, 0.0)
+          position: cgmath::vec3(2.0, 23.0, 0.0)
         , velocity: cgmath::vec3(0.0, 0.0, 0.0)
         , jump_velocity: 4.3
         , orientation: Orientation { rotation_y: Rad(0.0), rotation_z: Rad(0.0) }
 
-        , speed: 6.0
+        , speed: 4.0
+        , size: cgmath::vec3(1.0, 2.0, 1.0)
     };
 
     let mut keyboard = HashSet::<VirtualKeyCode>::default();
@@ -483,8 +529,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 in vec4 colour;
 
                 // Per instance
-                in vec3 world_position;
-                in vec2 texture_offset;
+                //in vec3 world_position;
+                //in vec2 texture_offset;
 
                 uniform mat4 projection;
                 uniform mat4 view;
@@ -499,10 +545,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 vec2 cube_face_size = vec2(192.0/atlas_size.x, 192.0/atlas_size.y);
 
                 void main() {
-                    gl_Position = projection * view * vec4(position + world_position, 1.0);
-                    // world_position = vec4(position + world_position, 1.0);
-                    pos = position + world_position;
-                    v_tex_coords = vec2(tex_coords.x, tex_coords.y / atlas_size.y) + texture_offset;
+                    gl_Position = projection * view * vec4(position, 1.0);
+                    // world_position = vec4(position, 1.0);
+                    pos = position;
+                    v_tex_coords = vec2(tex_coords.x, tex_coords.y);
                     v_colour = colour;
                 }
             ",
@@ -532,7 +578,78 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     //f_colour = v_colour;
                     float d = distance(pos, light_position);
                     // float light_intensity = clamp(1.0/(d*d*0.1*0.1), 0.0, 1.0);
-                    f_colour = texture(tex, v_tex_coords);
+                    // f_colour = texture(tex, v_tex_coords);
+                    f_colour = v_colour * vec4(1.0, 1.0, 1.0, texture(tex, v_tex_coords).r);
+                }
+            "
+        }
+    )?;
+
+    let textured_array_shader = program!(
+        &display,
+        140 => {
+            vertex: "
+                #version 140
+
+                in vec3 position;
+                in vec2 tex_coords;
+                in float texture_index;
+                in vec4 colour;
+
+                // Per instance
+                in vec3 world_position;
+                in vec2 texture_offset;
+
+                uniform mat4 projection;
+                uniform mat4 view;
+
+                out vec2 v_tex_coords;
+                flat out float v_tex_index;
+                out vec4 v_colour;
+                out vec3 pos;
+
+                uniform vec3 light_position;
+
+                vec2 atlas_size = vec2(6.0, 6.0);
+                vec2 cube_face_size = vec2(192.0/atlas_size.x, 192.0/atlas_size.y);
+
+                void main() {
+                    gl_Position = projection * view * vec4(position + world_position, 1.0);
+                    // world_position = vec4(position + world_position, 1.0);
+                    pos = position + world_position;
+                    v_tex_coords = vec2(tex_coords.x, tex_coords.y / atlas_size.y) + texture_offset;
+                    v_colour = colour;
+                    v_tex_index = texture_index;
+                }
+            ",
+
+            fragment: "
+                #version 140
+                uniform sampler2DArray textures;
+                in vec2 v_tex_coords;
+                flat in float v_tex_index;
+                // in vec4 gl_FragCoord;
+                in vec4 v_colour;
+                out vec4 f_colour;
+
+                uniform vec3 light_position;
+                // in vec4 world_position;
+                in vec3 pos;
+
+                // Converts a color from sRGB gamma to linear light gamma
+                vec4 toLinear(vec4 sRGB) {
+                    bvec4 cutoff = lessThan(sRGB, vec4(0.04045));
+                    vec4 higher = pow((sRGB + vec4(0.055))/vec4(1.055), vec4(2.4));
+                    vec4 lower = sRGB/vec4(12.92);
+
+                    return mix(higher, lower, cutoff);
+                }
+
+                void main() {
+                    //f_colour = v_colour;
+                    float d = distance(pos, light_position);
+                    // float light_intensity = clamp(1.0/(d*d*0.1*0.1), 0.0, 1.0);
+                    f_colour = texture(textures, vec3(v_tex_coords.x, v_tex_coords.y * 6.0, v_tex_index));
                 }
             "
         }
@@ -544,9 +661,40 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             vertex: "
                 #version 140
                 in vec3 position;
-                //in vec2 tex_coords;
                 in vec4 colour;
-                //out vec2 v_tex_coords;
+
+                out vec4 v_colour;
+
+                uniform mat4 modelview;
+
+                void main() {
+                    gl_Position = modelview * vec4(position, 1.0);
+                    //v_tex_coords = tex_coords;
+                    v_colour = colour;
+                }
+            ",
+
+            fragment: "
+                #version 140
+                //uniform sampler2D tex;
+                in vec2 v_tex_coords;
+                // in vec4 gl_FragCoord;
+                in vec4 v_colour;
+                out vec4 f_colour;
+                void main() {
+                    f_colour = v_colour;
+                }
+            "
+        }
+    )?;
+
+    let monochrome_shader = program!(
+        &display,
+        140 => {
+            vertex: "
+                #version 140
+                in vec3 position;
+                uniform vec4 colour;
                 out vec4 v_colour;
                 uniform mat4 modelview;
                 void main() {
@@ -569,8 +717,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             "
         }
     )?;
-
-    let _scale = display.gl_window().window().scale_factor();
     
     let mut time_of_last_frame = Instant::now();
 
@@ -580,16 +726,76 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let axes_vertex_buffer = glium::VertexBuffer::new(&display, &geometry::perpendicular_axes_xyz(200.0, 200.0, 200.0)).unwrap();
 
     let texture_atlas = load_texture(&display, "/Users/jonatan/kuliga kodprojekt/oxide/src/voxels/assets/textures/texture_atlas_layers.png".to_string());
+    let textures_array = load_array_texture(
+        &display,
+        vec![
+              "/Users/jonatan/kuliga kodprojekt/oxide/src/voxels/assets/textures/blocks/dirt.png".to_string()
+            , "/Users/jonatan/kuliga kodprojekt/oxide/src/voxels/assets/textures/blocks/grass.png".to_string()
+            , "/Users/jonatan/kuliga kodprojekt/oxide/src/voxels/assets/textures/blocks/stone.png".to_string()
+        ]
+    );
+
+    let o = cgmath::vec3(-(width as f32) / 2.0 + 20.0, -(height as f32) / 2.0, 0.0);
+
+    let mut font_data = include_bytes!("./assets/fonts/Hasklig-Medium.otf");
+    let mut font: Font = Font::try_from_bytes(font_data as &[u8]).unwrap();
+    let scale = display.gl_window().window().scale_factor();
+
+    let (cache_width, cache_height) = ((width as f64 * scale) as u32, (height as f64 * scale) as u32);
+    println!("(cache_width, cache_height) {} {}", cache_width, cache_height);
+    let mut glyph_cache = Cache::builder()
+        .dimensions(cache_width, cache_height)
+        .build();
+    let glyph_cache_texture = glium::texture::Texture2d::with_format(
+            &display,
+            glium::texture::RawImage2d {
+                data: Cow::Owned(vec![128u8; cache_width as usize * cache_height as usize]),
+                width: cache_width,
+                height: cache_height,
+                format: glium::texture::ClientFormat::U8,
+            },
+            glium::texture::UncompressedFloatFormat::U8,
+            glium::texture::MipmapsOption::NoMipmap,
+        )?;
+    let text_quad_vertex_buffer = glium::VertexBuffer::new(&display, &geometry::quad_vertices_xz(2.0, 2.0)).unwrap();
+    let text_vertex_buffer = text::create_text_vertices(&display, &font, &mut glyph_cache, scale as f32, &glyph_cache_texture, cache_width, &vec!["Harry Potter".to_string(), "and the Fiddler of Razzmatazz".to_string()]);
 
     let mut graphics_resources = GraphicsCardResources {
         textured_shader: textured_shader
       , coloured_shader: coloured_shader
+      , textured_array_shader: textured_array_shader
+      , monochrome_shader: monochrome_shader
+
       , cube_vertex_buffer: cube_vertex_buffer
       , axes_vertex_buffer: axes_vertex_buffer
+
       , texture_atlas: texture_atlas
+      , textures_array: textures_array
+
+      , shapes: vec![
+          (create_shape_buffers(&display, ui::rounded_rectangle_outlined(62.0, 62.0, 2.0, 8.0)),
+          (0 .. 9)
+            .map(|i| { (o + cgmath::vec3(i as f32 * 70.0, 62.0 * 0.5, 0.0), [0.0, 0.0, 0.85, 1.0]) })
+            .collect()
+          )
+      , (
+          create_shape_buffers(&display, ui::rounded_rectangle_filled(62.0, 62.0, 8.0)),
+          (0 .. 9)
+            .map(|i| { (o + cgmath::vec3(i as f32 * 70.0, 62.0 * 0.5, 0.0), [0.0, 1.0, 0.25, 1.0]) })
+            .collect()
+        )
+      ]
+      
+      , font: font
+      , glyph_cache: glyph_cache
+      , glyph_cache_texture: glyph_cache_texture
+      , text_vertex_buffer: text_vertex_buffer
+      , text_quad_vertex_buffer: text_quad_vertex_buffer
     };
 
     let mut world = create_world();
+
+    let program_start_time: Instant = Instant::now();
 
     event_loop.run(move |event, _, control_flow| {
         let now = Instant::now();
@@ -686,10 +892,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             tick(&keyboard, &mut player, &mut world, dt_seconds);
             render_frame(
                 &display,
-                &graphics_resources,
+                &mut graphics_resources,
                 &Settings { use_perspective: true, primitive: *primitive },
                 &player,
                 &world,
+                program_start_time
             );
             time_of_last_frame = now;
         }
